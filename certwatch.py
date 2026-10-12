@@ -9,8 +9,10 @@ Exit codes:
 Methods:
   tls:      connect with TLS immediately
   xmpp-tls: negotiate XMPP STARTTLS (RFC 6120), then upgrade to TLS
+  smtp-tls: negotiate SMTP STARTTLS (RFC 3207), then upgrade to TLS
+  imap-tls: negotiate IMAP STARTTLS (RFC 2595), then upgrade to TLS
 
-Both methods disable certificate trust-chain and hostname validation: the
+All methods disable certificate trust-chain and hostname validation: the
 goal is to fingerprint the certificate, not to judge its trustworthiness.
 """
 
@@ -26,6 +28,7 @@ import xml.etree.ElementTree as ET
 XMPP_TLS_NS = "urn:ietf:params:xml:ns:xmpp-tls"
 XMPP_STREAMS_NS = "http://etherx.jabber.org/streams"
 MAX_STREAM_BUFFER = 65536  # Refuse to buffer more than this per stanza read.
+MAX_LINE_BUFFER = 8192  # Refuse to buffer more than this per protocol line.
 
 
 def parse_args():
@@ -41,7 +44,7 @@ def parse_args():
     )
     parser.add_argument(
         "--method",
-        choices=("tls", "xmpp-tls"),
+        choices=("tls", "xmpp-tls", "smtp-tls", "imap-tls"),
         default="tls",
         help="TLS connection method (default: tls)",
     )
@@ -66,28 +69,64 @@ def parse_args():
     return args
 
 
-def get_certificate_sha256(host, port, timeout):
+def make_client_context():
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
+    return context
 
+
+def sni_hostname(host):
     try:
         ipaddress.ip_address(host)
-        server_hostname = None  # IP literals are not DNS SNI names.
+        return None  # IP literals are not DNS SNI names.
     except ValueError:
-        server_hostname = host  # Send SNI for DNS hostnames.
+        return host  # Send SNI for DNS hostnames.
 
-    with socket.create_connection((host, port), timeout=timeout) as raw_sock:
-        raw_sock.settimeout(timeout)
-        with context.wrap_socket(
-            raw_sock, server_hostname=server_hostname
-        ) as tls_sock:
-            cert_der = tls_sock.getpeercert(binary_form=True)
+
+def read_line(sock, timeout, buffer=b"", max_size=MAX_LINE_BUFFER):
+    """Read one CRLF/LF-terminated line, return it without the terminator.
+
+    `buffer` carries bytes read past the previous line's terminator (empty
+    on the first call); bytes past this line's terminator are returned too,
+    so the caller can chain calls without losing pipelined data.
+    """
+    line = bytearray(buffer)
+    while b"\n" not in line:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("Connection closed while reading a line")
+        line += chunk
+        if b"\n" in line:
+            break
+        if len(line) > max_size:
+            raise RuntimeError("Protocol input exceeds line length limit")
+    end = line.index(b"\n")
+    if end > max_size:  # Line content alone (terminator excluded) is too long.
+        raise RuntimeError("Protocol input exceeds line length limit")
+    tail = bytes(line[end + 1 :])  # Bytes read past the terminator, if any.
+    return bytes(line[:end]).rstrip(b"\r"), tail
+
+
+def starttls_sha256(raw_sock, server_hostname):
+    """Upgrade an existing socket to TLS and hash the leaf certificate."""
+    with make_client_context().wrap_socket(
+        raw_sock, server_hostname=server_hostname
+    ) as tls_sock:
+        cert_der = tls_sock.getpeercert(binary_form=True)
 
     if not cert_der:
         raise RuntimeError("TLS peer did not provide a certificate")
 
     return hashlib.sha256(cert_der).hexdigest()
+
+
+def get_certificate_sha256(host, port, timeout):
+    server_hostname = sni_hostname(host)
+
+    with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+        raw_sock.settimeout(timeout)
+        return starttls_sha256(raw_sock, server_hostname)
 
 
 class StreamBuffer:
@@ -170,15 +209,7 @@ class StreamBuffer:
 
 def get_certificate_sha256_xmpp(host, port, timeout):
     """Retrieve the leaf certificate via XMPP STARTTLS (RFC 6120)."""
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-
-    try:
-        ipaddress.ip_address(host)
-        server_hostname = None  # IP literals are not DNS SNI names.
-    except ValueError:
-        server_hostname = host  # Send SNI even though validation is off.
+    server_hostname = sni_hostname(host)
 
     with socket.create_connection((host, port), timeout=timeout) as raw_sock:
         raw_sock.settimeout(timeout)
@@ -217,20 +248,91 @@ def get_certificate_sha256_xmpp(host, port, timeout):
             )
 
         # Upgrade the existing socket in place; do not reconnect.
-        with context.wrap_socket(
-            raw_sock, server_hostname=server_hostname
-        ) as tls_sock:
-            cert_der = tls_sock.getpeercert(binary_form=True)
+        return starttls_sha256(raw_sock, server_hostname)
 
-    if not cert_der:
-        raise RuntimeError("TLS peer did not provide a certificate")
 
-    return hashlib.sha256(cert_der).hexdigest()
+def get_certificate_sha256_smtp(host, port, timeout):
+    """Retrieve the leaf certificate via SMTP STARTTLS (RFC 3207)."""
+    server_hostname = sni_hostname(host)
+
+    with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+        raw_sock.settimeout(timeout)
+
+        code, _, pending = smtp_reply(raw_sock, timeout)  # Greeting.
+        if code != "220":
+            raise RuntimeError(f"SMTP greeting failed: {code}")
+
+        raw_sock.sendall(b"EHLO certwatch\r\n")
+        code, lines, pending = smtp_reply(raw_sock, timeout, buffer=pending)
+        if code != "250":
+            raise RuntimeError(f"SMTP EHLO failed: {code}")
+
+        # Send STARTTLS without requiring its advertisement: some servers
+        # (e.g. high-volume relays) accept STARTTLS but omit it from EHLO.
+        raw_sock.sendall(b"STARTTLS\r\n")
+        code, _, pending = smtp_reply(raw_sock, timeout, buffer=pending)
+        if code != "220":
+            raise RuntimeError(f"SMTP STARTTLS failed: {code}")
+
+        # Upgrade the existing socket in place; do not reconnect.
+        return starttls_sha256(raw_sock, server_hostname)
+
+
+def smtp_reply(sock, timeout, buffer=b""):
+    """Read one SMTP reply (RFC 5321 section 4.2); return (code, lines, tail).
+
+    A reply is one or more lines, each 'ddd' followed by '-' (more lines
+    follow) or ' ' (this is the final line) and text. `buffer` carries bytes
+    read past the previous reply, `tail` those read past this one.
+    """
+    code, lines, pending = None, [], buffer
+    while True:
+        line, pending = read_line(sock, timeout, buffer=pending)
+        text = line.decode("utf-8", "replace")
+        if len(text) < 4 or not text[:3].isdigit() or text[3] not in " -":
+            raise RuntimeError(f"Malformed SMTP reply: {text!r}")
+        if code is None:
+            code = text[:3]
+        lines.append(text[4:])
+        if text[3] == " ":
+            return code, lines, pending
+
+
+def get_certificate_sha256_imap(host, port, timeout):
+    """Retrieve the leaf certificate via IMAP STARTTLS (RFC 2595)."""
+    server_hostname = sni_hostname(host)
+
+    with socket.create_connection((host, port), timeout=timeout) as raw_sock:
+        raw_sock.settimeout(timeout)
+
+        tag = "cw0"
+        line, pending = read_line(raw_sock, timeout)  # Server greeting.
+        if not line.upper().startswith(b"* OK"):
+            raise RuntimeError(f"IMAP server rejected the session: {line!r}")
+
+        raw_sock.sendall(f"{tag} STARTTLS\r\n".encode("utf-8"))
+        while True:
+            line, pending = read_line(raw_sock, timeout, buffer=pending)
+            if line.upper().startswith(b"* BYE"):
+                raise RuntimeError("IMAP server closed the session")
+            if not line.startswith(tag.encode("utf-8") + b" "):
+                continue  # Untagged response; wait for the tagged one.
+            parts = line.split()
+            if len(parts) < 2 or parts[1].upper() != b"OK":
+                raise RuntimeError(
+                    f"IMAP STARTTLS failed: {line.decode('utf-8', 'replace')}"
+                )
+            break
+
+        # Upgrade the existing socket in place; do not reconnect.
+        return starttls_sha256(raw_sock, server_hostname)
 
 
 METHODS = {
     "tls": get_certificate_sha256,
     "xmpp-tls": get_certificate_sha256_xmpp,
+    "smtp-tls": get_certificate_sha256_smtp,
+    "imap-tls": get_certificate_sha256_imap,
 }
 
 

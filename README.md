@@ -15,8 +15,9 @@ within CA forum-based trust chains, essentially making it ssh-like.
 ## Usage
 
 ```
-usage: certwatch.py [-h] --host HOST [--port PORT] [--method {tls,xmpp-tls}]
-                    [--db DB] [--timeout TIMEOUT]
+usage: certwatch.py [-h] --host HOST [--port PORT]
+                    [--method {tls,xmpp-tls,smtp-tls,imap-tls}] [--db DB]
+                    [--timeout TIMEOUT]
 
 Detect changes to a server's TLS leaf certificate.
 
@@ -24,7 +25,7 @@ options:
   -h, --help            show this help message and exit
   --host HOST           Hostname or IP address
   --port PORT           TCP port (default: 443)
-  --method {tls,xmpp-tls}
+  --method {tls,xmpp-tls,smtp-tls,imap-tls}
                         TLS connection method (default: tls)
   --db DB               SQLite database path (default: certwatch.sqlite3)
   --timeout TIMEOUT     Connection and handshake timeout in seconds (default:
@@ -38,12 +39,7 @@ sent for DNS names but not IP literals.
 
 ## Dependencies
 
-python 3.14.8 standard library covers required dependencies.
-
-## Todo
-
-- smtp start tls
-- imap start tls
+python3.6+ standard library covers required dependencies.
 
 ## How it works
 
@@ -57,6 +53,15 @@ requires the `urn:ietf:params:xml:ns:xmpp-tls` STARTTLS feature, sends
 socket to  TLS. The XMPP  stream is a  single XML document  that never
 closes, so stanzas  are extracted from a byte  buffer that reassembles
 fragmented reads and preserves bytes read past a stanza boundary.
+
+With `--method smtp-tls` it performs  the RFC 3207  STARTTLS  handshake:
+it reads the `220` greeting, sends `EHLO`, requires `STARTTLS` among the
+advertised extensions, sends `STARTTLS`, and requires a `220` reply.
+
+With `--method imap-tls` it performs the RFC 2595 STARTTLS handshake: it
+requires an untagged `* OK` greeting, sends a tagged `STARTTLS` command,
+skips  untagged responses, and requires  a tagged  `OK` before upgrading
+the existing socket to TLS.
 
 After the handshake, the peer's DER-encoded leaf certificate is hashed
 with SHA-256. The  hash is compared against the previous  value in the
