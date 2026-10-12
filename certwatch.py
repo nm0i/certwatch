@@ -12,6 +12,8 @@ Methods:
   smtp-tls: negotiate SMTP STARTTLS (RFC 3207), then upgrade to TLS
   imap-tls: negotiate IMAP STARTTLS (RFC 2595), then upgrade to TLS
 
+We intentionally opt for dirty hacks to avoid using external libraries.
+
 All methods disable certificate trust-chain and hostname validation: the
 goal is to fingerprint the certificate, not to judge its trustworthiness.
 """
@@ -27,8 +29,12 @@ import xml.etree.ElementTree as ET
 
 XMPP_TLS_NS = "urn:ietf:params:xml:ns:xmpp-tls"
 XMPP_STREAMS_NS = "http://etherx.jabber.org/streams"
-MAX_STREAM_BUFFER = 65536  # Refuse to buffer more than this per stanza read.
-MAX_LINE_BUFFER = 8192  # Refuse to buffer more than this per protocol line.
+
+# Max read buffer per stanza read (xmpp)
+MAX_STREAM_BUFFER = 65536
+
+# Max red buffer per protocol (smtp, imap) line
+MAX_LINE_BUFFER = 8192
 
 
 def parse_args():
@@ -70,9 +76,11 @@ def parse_args():
 
 
 def make_client_context():
+
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
+
     return context
 
 
@@ -92,6 +100,7 @@ def read_line(sock, timeout, buffer=b"", max_size=MAX_LINE_BUFFER):
     so the caller can chain calls without losing pipelined data.
     """
     line = bytearray(buffer)
+
     while b"\n" not in line:
         chunk = sock.recv(4096)
         if not chunk:
@@ -102,8 +111,10 @@ def read_line(sock, timeout, buffer=b"", max_size=MAX_LINE_BUFFER):
         if len(line) > max_size:
             raise RuntimeError("Protocol input exceeds line length limit")
     end = line.index(b"\n")
+
     if end > max_size:  # Line content alone (terminator excluded) is too long.
         raise RuntimeError("Protocol input exceeds line length limit")
+
     tail = bytes(line[end + 1 :])  # Bytes read past the terminator, if any.
     return bytes(line[:end]).rstrip(b"\r"), tail
 
@@ -178,7 +189,10 @@ class StreamBuffer:
             return None
         if tag.endswith(b"/>"):
             # Self-closing top-level element.
-            raw, self.buffer = self.buffer[: close + 1], self.buffer[close + 1 :]
+            raw, self.buffer = (
+                self.buffer[: close + 1],
+                self.buffer[close + 1 :],
+            )
             return self._parse(raw)
         name = tag[1:-1].split()[0]
         if name == b"stream:stream":
@@ -198,9 +212,14 @@ class StreamBuffer:
         # Declared namespaces are present on the root <stream:stream>, but a
         # single extracted stanza depends on undeclared prefixes. Inject the
         # stream namespace declaration so ElementTree can resolve it.
+
         if b"stream:" in raw and XMPP_STREAMS_NS.encode() not in raw:
             close = raw.find(b">")
-            raw = raw[:close] + f" xmlns:stream='{XMPP_STREAMS_NS}'".encode() + raw[close:]
+            raw = (
+                raw[:close]
+                + f" xmlns:stream='{XMPP_STREAMS_NS}'".encode()
+                + raw[close:]
+            )
         try:
             return ET.fromstring(raw)
         except ET.ParseError as exc:
@@ -209,6 +228,7 @@ class StreamBuffer:
 
 def get_certificate_sha256_xmpp(host, port, timeout):
     """Retrieve the leaf certificate via XMPP STARTTLS (RFC 6120)."""
+
     server_hostname = sni_hostname(host)
 
     with socket.create_connection((host, port), timeout=timeout) as raw_sock:
@@ -226,11 +246,14 @@ def get_certificate_sha256_xmpp(host, port, timeout):
 
         # Read stanzas until we see the server's stream features. The
         # features stanza may or may not be the first stanza received.
+
         features = None
         while features is None:
             element = stream.read_element()
             if element.tag == f"{{{XMPP_STREAMS_NS}}}error":
-                raise RuntimeError(f"XMPP stream error: {ET.tostring(element)!r}")
+                raise RuntimeError(
+                    f"XMPP stream error: {ET.tostring(element)!r}"
+                )
             if element.tag == f"{{{XMPP_STREAMS_NS}}}features":
                 features = element
 
@@ -241,7 +264,9 @@ def get_certificate_sha256_xmpp(host, port, timeout):
 
         response = stream.read_element()
         if response.tag == f"{{{XMPP_TLS_NS}}}failure":
-            raise RuntimeError("XMPP STARTTLS failed: server returned <failure/>")
+            raise RuntimeError(
+                "XMPP STARTTLS failed: server returned <failure/>"
+            )
         if response.tag != f"{{{XMPP_TLS_NS}}}proceed":
             raise RuntimeError(
                 f"XMPP STARTTLS failed: unexpected stanza {ET.tostring(response)!r}"
@@ -259,11 +284,13 @@ def get_certificate_sha256_smtp(host, port, timeout):
         raw_sock.settimeout(timeout)
 
         code, _, pending = smtp_reply(raw_sock, timeout)  # Greeting.
+
         if code != "220":
             raise RuntimeError(f"SMTP greeting failed: {code}")
 
         raw_sock.sendall(b"EHLO certwatch\r\n")
         code, lines, pending = smtp_reply(raw_sock, timeout, buffer=pending)
+
         if code != "250":
             raise RuntimeError(f"SMTP EHLO failed: {code}")
 
@@ -372,9 +399,7 @@ def main():
     key = f"{args.host.lower()}:{args.port}:{args.method}"
 
     try:
-        current_sha = METHODS[args.method](
-            args.host, args.port, args.timeout
-        )
+        current_sha = METHODS[args.method](args.host, args.port, args.timeout)
         status, previous_sha = record_and_compare(args.db, key, current_sha)
     except (
         OSError,
