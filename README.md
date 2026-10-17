@@ -12,6 +12,40 @@ changes or an error occurs.
 This monitoring tool should help circumvent 'malicious hoster' attack
 within CA forum-based trust chains, essentially making it ssh-like.
 
+## E-mail notifications via cron
+
+cron mails a job's  output  (stdout  and  stderr)  to the  local user,
+or  to  `MAILTO`  when set.  `certwatch.py`  prints  a  report  to  stderr
+only  when  the  certificate  changes  (exit  `1`)  or  an  error  occurs
+(exit  `2`),  so  a  plain  crontab  entry  is  a  complete  notification
+setup: no mail while the fingerprint stays the same, mail the moment it
+changes or a check fails.
+
+```crontab
+MAILTO=you@example.com
+# Check every 30 minutes. Use an absolute --db path: cron does not run
+# the job in the script's directory, so a relative path would create
+# the database in $HOME.
+*/30 * * * * /usr/local/bin/certwatch.py --host example.com \
+    --db /var/lib/certwatch/certwatch.sqlite3
+```
+
+A  sendmail-compatible  MTA  (postfix,  exim,  msmtp,  ...)  must  be
+installed  and  configured  for  cron  to  deliver  mail.  Add  one  line
+per endpoint; the  database key is `host:port:method`, so  separate cron
+lines can safely share a single database file.
+
+### With chronic
+
+`chronic`  (from  moreutils)  runs  a  command  and  discards  its output
+unless it exits non-zero, which is exactly  certwatch's  exit-code
+contract  (`1` changed, `2` error). Useful  outside  cron, or  inside  a
+crontab  to  keep  the  success  path  quiet  no matter what:
+
+```sh
+$ chronic certwatch.py --host example.com --db ~/.certwatch.sqlite3
+```
+
 ## Usage
 
 ```
