@@ -26,8 +26,7 @@ MAILTO=you@example.com
 # Check every 30 minutes. Use an absolute --db path: cron does not run
 # the job in the script's directory, so a relative path would create
 # the database in $HOME.
-*/30 * * * * /usr/local/bin/certwatch.py --host example.com \
-    --db /var/lib/certwatch/certwatch.sqlite3
+30 */12 * * * /usr/local/bin/certwatch.py --host example.com --db /var/lib/certwatch/certwatch.sqlite3
 ```
 
 A  sendmail-compatible  MTA  (postfix,  exim,  msmtp,  ...)  must  be
@@ -43,7 +42,13 @@ contract  (`1` changed, `2` error). Useful  outside  cron, or  inside  a
 crontab  to  keep  the  success  path  quiet  no matter what:
 
 ```sh
-$ chronic certwatch.py --host example.com --db ~/.certwatch.sqlite3
+chronic certwatch.py --host example.com --db ~/.certwatch.sqlite3
+```
+
+or, in crontab:
+
+``` crontab
+30 */12 * * * chronic /usr/local/bin/certwatch.py --host example.com --db /var/lib/certwatch/certwatch.sqlite3
 ```
 
 ## Usage
