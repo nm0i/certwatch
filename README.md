@@ -9,8 +9,12 @@ changes or an error occurs.
 
 ## Why
 
-This monitoring tool should help circumvent 'malicious hoster' attack
-within CA forum-based trust chains, essentially making it ssh-like.
+This tool helps you to monitor certificate of your host from
+public-facing machine. You're expected to compare it to an internal
+certificate when suspicious change happens.
+
+This should help circumvent 'malicious hoster' attack within CA
+forum-based trust chains, essentially making it ssh-like.
 
 ## E-mail notifications via cron
 
